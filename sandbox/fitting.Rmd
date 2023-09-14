@@ -1,0 +1,632 @@
+---
+title: "Modeling Spatial Technical Varition"
+output: html_notebook
+---
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/Users/kaylajackson/Library/CloudStorage/OneDrive-CaliforniaInstituteofTechnology/Projects/spatial_normalization/normalize')
+```
+
+# Loading Modules
+```{r mods}
+library(Matrix)
+library(sf)
+library(spdep)
+library(cmdstanr)
+library(StanHeaders)
+
+library(fs)
+library(readr)
+library(magrittr)
+
+library(glue)
+library(stringr)
+
+library(tibble)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+library(posterior)
+library(bayesplot)
+
+set.seed(3422)
+```
+
+# Define helper functions
+```{r funcs}
+# Find rook style neighbors
+st_rook = function(a, b = a) st_relate(a, b, pattern = "F***1****")
+
+# Convert sgbp to nb
+as.nb.sgbp <- function(x, ...) {
+  attrs <- attributes(x)
+  x <- lapply(x, function(i) { if(length(i) == 0L) 0L else i } )
+  attributes(x) <- attrs
+  class(x) <- "nb"
+  x
+}
+
+# Check if ranges overlap
+check_overlap <- function(data, x, y){
+  x = data[[x]]
+  y = data[[y]]
+  
+  if (length(x) != length(y)) return("length problems")
+  
+  grid <- tidyr::expand_grid(x1=seq_along(x), x2=seq_along(y)) 
+  grid <- dplyr::filter(grid, x1 < x2)
+  
+  
+  out <- purrr::pmap_dfr(grid, \(x1,x2){
+    c(id1=x1, id2=x2, res = `::`("DescTools", `%overlaps%`)(c(x[x1], y[x1]), c(x[x2],y[x2])))
+  })
+  
+  key <- dplyr::filter(out, res==1) %>% 
+    dplyr::mutate(key=paste0(id1,id2)) %>% 
+    dplyr::pull(key)
+  
+  purrr::map(seq_along(x), \(ind){
+    finds <- stringr::str_detect(key, as.character(ind))
+    stringr::str_remove(key[finds], as.character(ind))
+  })
+}
+```
+# Load Data
+```{r}
+# Load physical parameters
+burst_params <- read_csv("data/Larsson_c57_kinetic_params.csv", skip=1,
+                         col_names = c("gene", "mean_exprs","bs", 'bs_conf'),
+                         show_col_types = FALSE)
+
+burst_params <-
+  burst_params %>%
+  filter(mean_exprs > 1) %>%
+  mutate(
+    bs_conf = str_remove_all(bs_conf, "\\[|\\]"),
+    bs_conf = str_squish(bs_conf)
+  ) %>%
+  separate_wider_delim(
+    bs_conf, delim=" ", 
+    names = c(NA, "bs_conf_ll", "bs_conf_ul"),
+    cols_remove=FALSE) %>%
+  type_convert() %>%
+  filter(!is.na(bs_conf_ll))
+
+```
+
+# Define constants and hyperparameters
+```{r}
+# Parameters for cell/gene simulation
+grid_size = 10
+n_celltypes = 2
+n_genes = 100
+labels <- letters[seq(n_celltypes)]
+remainder <- grid_size^2 %% n_celltypes
+
+type_size <- rep(floor(grid_size^2/n_celltypes), n_celltypes)
+type_size[n_celltypes] <- type_size[n_celltypes] + remainder
+names(type_size) <- labels
+
+# How will physical kinetic parameters be sampled?
+resample <- nrow(burst_params) < n_genes
+
+# Parameters affecting structure of technical variance
+rho <- 0.99
+sigma_sq <- 1
+```
+
+# Generate neighborhood graph 
+
+```{r}
+sfc = st_sfc(st_point(c(0,0)), st_point(c(grid_size,grid_size)))
+grd =  st_make_grid(sfc, n = c(grid_size,grid_size))
+
+sfc_sgbp_rook = st_rook(grd)
+
+sf_nb_rook = as.nb.sgbp(sfc_sgbp_rook)
+col.w <- nb2listw(sf_nb_rook)
+
+
+# Style = B is the binary coding. 
+# Style = W is the row normalized. 
+W <- nb2mat(sf_nb_rook, style="B")
+nn <- rowSums(W)
+
+borders <- which(nn < 4)
+```
+
+```{r}
+dfc <- st_sf(geometry = grd)
+```
+
+## Separate neighborhood graph for interior points vs. border points
+```{r}
+# Exterior
+nb_rook_ext = st_rook(dfc[borders,])
+nb_rook_ext = as.nb.sgbp(nb_rook_ext)
+col.w.ext <- nb2listw(nb_rook_ext)
+
+W_ext <- nb2mat(nb_rook_ext, style="B")
+D_ext <- Diagonal(length(borders), rowSums(W_ext))
+
+# Interior
+nb_rook_int = st_rook(dfc[-borders,])
+nb_rook_int = as.nb.sgbp(nb_rook_int)
+col.w.int <- nb2listw(nb_rook_int)
+
+W_int <- nb2mat(nb_rook_int, style="B")
+D_int <- Diagonal(length(borders), rowSums(W_int))
+```
+
+# Generate covariance matrix 
+Here, the covariance matrix  encodes how technical variance is structured across the lattice
+```{r}
+D <- diag(100)
+diag(D) <- nn
+
+IW = D - rho*W
+OMEGA <- (1/sigma_sq) * IW
+```
+
+# Construct technical variance
+Use the copula function to construct a multivariate distribution with beta marginals.
+Each marginal distribution has the following form: 
+
+$X_i \sim \text{Beta}(0, 10)$
+
+### Change of idea
+Now, 
+
+$\test{logit}(p) \sim \text{MVN}(0, Q^{-1})$, where
+
+$Q^{-1}$ is the precision matrix constructed from the lattice and neighborhood matrix. In this construction we guarantee that $Q^{-1}$ is non-singular, and thus, we have a proper CAR model to model spatial correlation.  
+
+```{r}
+# Sample from MVN parameterized by precision matrix
+# Samples are drawn using Cholesky and STD MVN
+
+Z <- stanFunction("multi_normal_prec_rng", mu=rep(0,100), S=OMEGA)
+# CDF_Z <- pnorm(Z, 0, diag(solve(OMEGA)))
+# theta  <- qbeta(CDF_Z, 1, 10)
+
+theta <- 1/(1+exp(-Z))
+```
+
+## Confirm that technical variance is spatially correlated
+```{r}
+(moran(theta, col.w, n=length(sf_nb_rook), Szero(col.w)))
+```
+
+```{r}
+dfc$theta <- theta
+plot(dfc["theta"])
+```
+
+# Simulate Burst Parameters for "genes"
+```{r}
+dfc$type <- rep(labels, type_size)
+
+dfc <- dfc %>% group_by(type) %>% 
+  mutate(cellid = paste(type, row_number(), sep="_")) %>% 
+  ungroup() %>%
+  mutate(border = ifelse(row_number() %in% borders, TRUE, FALSE))
+
+dfc <- mutate(dfc, type_border = glue("{type}_{border}"))
+
+# type_size_new <- dfc %>% group_by(type_border) %>% tally() %>% pull(n, type_border)
+# type_size_new <- names(type_size_new)
+
+burst_params_int <- lapply(seq(n_celltypes), function(x){
+  rows = sample(nrow(burst_params), n_genes, replace=resample)
+  burst_params[rows,] %>% 
+    mutate(
+      type = labels[x],
+      type_border = glue("{type}_FALSE"),
+      cellid = list(dfc$cellid[dfc$type_border == glue("{type}_FALSE")]),
+      p = list(dfc$theta[dfc$type_border == glue("{type}_FALSE")]),
+      gene = paste0("gene_", row_number()))
+})
+
+burst_params_int <- bind_rows(burst_params_int) %>% arrange(gene, type)
+burst_params_int$bs_p <- pmap(burst_params_int, \(bs, p, ...) bs*p)
+
+# Update mean expression around the border of the grid
+burst_params_ext <- burst_params_int %>%
+  split(.$gene) %>%
+  map(\(df) {
+    means <- rep(df$mean_exprs, type_size)
+    means[borders] <- 0
+
+    b_means1 <- crossprod(W, means)[,1]/rowSums(W)
+    corners <- which(b_means1 == 0)
+
+    b_means2 <- crossprod(W, b_means1)[,1]/rowSums(W)
+    b_means1[corners] <- b_means2[corners]
+
+    data.frame(mean_exprs = b_means1[borders], p = dfc$theta[borders],
+               type_border = dfc$type_border[borders],
+               cellid = dfc$cellid[borders])
+    })
+
+burst_params_ext <- bind_rows(burst_params_ext, .id = "gene")
+```
+
+Finally, sample counts with parameters
+```{r}
+# sample counts with technical variation
+counts_int <- burst_params_int %>% 
+  mutate(row = row_number()) %>% 
+  group_by(row) %>% 
+  group_map(~  rnbinom(length(.x$bs_p[[1]]), size=.x$bs_p[[1]], mu=.x$mean_exprs))
+
+burst_params_int$counts <- counts_int
+
+counts_int <- burst_params_int %>% 
+  unnest(c(counts, cellid)) %>% 
+  pivot_wider(id_cols=gene, names_from=cellid, values_from=counts)
+
+burst_params_ext <- burst_params_ext %>% 
+  rowwise() %>% 
+  mutate(counts = rpois(1, mean_exprs*p))
+  
+counts_ext <- burst_params_ext %>% 
+  pivot_wider(id_cols=gene, names_from=cellid, values_from=counts)
+
+counts <- merge(counts_int, counts_ext, by = 'gene')
+counts <- column_to_rownames(counts, var = "gene")
+
+ij_inds <- which(counts != 0, arr.ind = TRUE)
+x_inds <- apply(ij_inds, 1, \(x) counts[[x['row'],x['col']]])
+
+mtx <- sparseMatrix(i=ij_inds[,"row"], j=ij_inds[,"col"], x=x_inds,
+                    dimnames=list(rownames(counts), colnames(counts)))
+
+counts <- counts %>%
+  rownames_to_column('gene') %>% 
+  pivot_longer(-gene, names_to='cellid') %>% 
+  pivot_wider(names_from ='gene')
+```
+
+Add counts to sf dataframe
+```{r}
+dfc <- merge(dfc, counts, by = 'cellid')
+ord <- str_sort(dfc$cellid, numeric = TRUE)
+dfc <- dfc[match(ord, dfc$cellid),]
+```
+
+Add Moran's I coefficient to gene metadata. Interestingly, even though burst size is correlated across the grid, this does not guarantee that counts are correlated. What is says is that you can observe a gene that does not have spatial correlation, even though technical variation is spatially correlated. 
+```{r}
+res_moran <- burst_params_int %>%
+  group_by(gene) %>%
+  group_map(~  moran(unlist(.x$counts), col.w.int, n=length(nb_rook_int), Szero(col.w.int))$I)
+
+res_moran <- data.frame(moran = unlist(res_moran), gene = unique(burst_params_int$gene))
+burst_params_int <- merge(burst_params_int, res_moran, by = "gene")
+```
+
+Are there any genes that might be of interest ?
+```{r}
+# genes <- sim_burst_params %>% dplyr::filter(!str_detect(overlaps, "1|2|3|4")) %>% 
+#   distinct(gene) %>% pull(gene)
+genes <- burst_params_int %>% distinct(gene, .keep_all=TRUE) %>% 
+  slice_max(abs(moran), n=20) %>% pull(gene)
+
+plot(dfc[genes], max.plot=20)
+```
+# Fit Poisson CAR model with Stan
+```{r, pois-border}
+pois.file <- path("./stan/pois",ext="stan")
+
+# Compile and run
+pois.mod <- cmdstan_model(pois.file)
+```
+Data set up for border model
+```{r}
+g <- 'gene_23'
+
+nodes <- which(W_ext==1, arr.ind=TRUE)
+nodes <- nodes[nodes[,1] < nodes[,2],]
+
+# Set up data for STAN
+y <- counts_ext %>% filter(gene %in% g) %>% select(-gene) %>% unlist()
+
+# MU computation
+mns <- dfc[[g]]
+mns[borders] <- 0
+
+mu <- crossprod(W, mns)
+tmp <- crossprod(W, mu)
+corners <- which(nn == 2)
+mu[corners] <- tmp[corners]
+
+mu <- c(mu)/rowSums(W)
+mu <- mu[borders]
+
+data <- list(
+  N = length(borders), 
+  N_edges = nrow(nodes), 
+  D=as.matrix(D_ext),
+  W = as.matrix(W_ext),
+  mu = tst,
+  #mu = rep(10, 36),
+  counts = y
+)
+
+```
+
+```{r}
+fit.pois <- pois.mod$sample(data, chains=2)
+```
+
+```{r}
+draws <- as_draws_matrix(fit.pois)
+yrep <- draws[, glue::glue('counts_ppc[{1:36}]')]
+
+ppc_dens_overlay(y, yrep[1:200, ])
+```
+
+Some other diagnositics? Did we do an ok job? See `blah.R`
+# Fit NB model with Stan
+The model to fit is as follows
+
+$Y_{cg} \sim \text{Neg.Binomial}(\frac{\alpha}{\gamma}, bp)$
+
+where, $Y_{cg}$ represents the observed count in cell $c$ of gene $g$. The parameters $\alpha, \gamma,$ and $b$ are gene specific transcription rates, degradation rates, and burst sizes, respectively. The paramter $p$ is a technical parameter that represents the probability that a molecule is captured at each grid location. As written, the parameters are not uniquely identifiable. 
+
+```{r stan_setup}
+file <- path("stan/car",ext="stan")
+mod <- cmdstan_model(file)
+# mod$print()
+```
+
+## Format data for stan
+```{r}
+# Test on one gene
+y <- dfc[dfc$type_border == "b_FALSE",][[g]]
+hyperpars <- fit.pois$summary(c("car_rho", "car_scale"))$mean
+# cndl_means <- crossprod(W, y)[,]/nn
+# log_cndl_means <-  log(cndl_means+.Machine$double.eps,10)
+
+data <- 
+  list(
+    N = grid_size^2,
+    W = W,
+    count_n = length(y),
+    count_inds = which(dfc$type_border == 'b_FALSE'),
+    car_rho=hyperpars[1],
+    car_scale=hyperpars[2],
+    bs_mu = 0,
+    bs_var = 1, 
+    mu_mu = 0, 
+    mu_var = 5, 
+    counts = y
+  )
+```
+
+```{r}
+burst_params_int %>% 
+  filter(gene%in%g) %>% 
+  select(gene, type, mean_exprs, bs) %>% 
+  mutate(logbs = log(bs, 10))
+```
+
+```{r}
+fit <- mod$sample(data, chains=2, show_messages=FALSE)
+fit$summary(c("mu", "log_bs"))
+```
+
+```{r}
+data <- 
+  list(
+    N = grid_size^2,
+    W = W,
+    # count_n = length(y),
+    # count_inds = which(dfc$type_border == 'b_FALSE'),
+    car_rho=hyperpars[1],
+    car_scale=hyperpars[2],
+    bs_mu = 0,
+    bs_var = 1, 
+    mu_mu = 0, 
+    mu_var = 5, 
+    # counts = y
+  )
+
+fits_all <- burst_params_int %>%
+  group_by(gene, type) %>%
+  group_map(~ {
+    data$counts <- .x$counts[[1]]
+    data$count_n <- length(.x$counts[[1]])
+    data$count_ind <- which(dfc$type_border == .x$type_border[1])
+    
+    mod$sample(data, chains=2, show_messages=FALSE)$summary(c("mu", "log_bs"))
+    
+  })
+```
+Wrangle the fits
+```{r}
+nm <-  glue("{burst_params_int$gene}_{burst_params_int$type}")
+names(fits_all) <- nm
+
+fits_all <- bind_rows(fits_all, .id="id") %>% 
+  mutate(type = str_split_i(id, "_", -1), gene = str_remove(id, "_[ab]")) %>% 
+  select(-id)
+
+fits_all_mean <- fits_all %>% select(type, gene, variable, mean) %>% 
+  pivot_wider(names_from = variable, values_from = mean)
+
+
+```
+
+```{r}
+p1 <- fits_all_mean %>%
+  merge(burst_params_int) %>%
+  ggplot(aes(y=log(bs,10), x=log_bs)) + 
+  geom_abline(
+    slope=1,
+    intercept=0,
+    linewidth=1.5,
+    linetype='dashed',
+    alpha=0.75,
+    color='red'
+  ) + 
+  geom_point(shape=21, fill='gray', alpha=0.8,size=rel(2)) +
+  theme_bw() + 
+  labs(
+    x = TeX(r'(log($\hat{b}$))'),
+    y = TeX(r'(log($b$))')
+  )+
+  theme(
+    aspect.ratio=1,
+    panel.grid = element_blank(),
+  )
+
+ggsave('burst_size.png', p1, width=2,height=2, scale=2)
+```
+
+```{r}
+# a simple function that takes in vector of counts and stan model, and returns estimated parameters
+stan.optim <- function(model, data, counts,...){
+  data$counts <- counts
+  
+  fit <- model$optimize(data, ...)
+  fit$summary()
+  
+  }
+```
+## Fit the model
+Note, each cell type should be fit separately 
+```{r}
+model_fits <- sim_burst_params %>% 
+  split(.$gene) %>%
+  map(\(x){
+    stan.optim(mod, data, x$counts[[1]]) %>%
+      pivot_wider(names_from="variable", values_from='estimate', 
+                  names_glue='fit_{variable}') 
+  })
+
+model_fits <- list_rbind(model_fits, names_to = 'gene')
+
+model_fits <- merge(sim_burst_params, model_fits, by = 'gene') %>%
+  select(gene, fit_mu, mean_exprs, fit_burst_size, bs, type)
+
+```
+
+```{r}
+ggplot(model_fits, aes(y=log(bs), x=log(fit_burst_size))) + 
+  geom_point() + 
+  geom_abline(slope=1, intercept=0, color='red')
+```
+
+```{r}
+ggplot(model_fits, aes(y=log(mean_exprs), x=log(fit_mu))) + 
+  geom_point() + 
+  geom_abline(slope=1, intercept=0, color='red')
+```
+
+
+# Some debugging
+```{r}
+# Based on these results, I think somehow the counts and parameters are mixed up
+out <- map_df(seq(10), \(x){
+  y <- rnbinom(100, size=bs*theta, mu=mm)
+  stan.optim(mod, data, y, theta)
+}, .id = 'iter')
+```
+
+
+# Lab meeting results
+```{r}
+# a simple function that takes in vector of counts and stan model, and returns estimated parameters
+stan.optim <- function(model, data, counts, rates, ...){
+  data$counts <- counts
+  data$count_n <- length(counts)
+  data$rates <- rates
+  
+  fit <- model$optimize(data, ...)
+  fit$summary()
+  
+  }
+```
+
+```{r}
+file <- path("stan/car_prob",ext="stan")
+mod <- cmdstan_model(file)
+```
+
+```{r}
+data <- 
+  list(
+    bs_mu = 0,
+    bs_var = 5, 
+    mu_mu = 0, 
+    mu_var = 10 
+  )
+
+model_fits <- burst_params_int %>%
+  #filter(gene == 'gene_1') %>%
+  group_by(gene, type) %>%
+  group_map(\(df, name){
+    stan.optim(mod, data, df$counts[[1]], df$p[[1]]) %>%
+      pivot_wider(names_from="variable", values_from='estimate',
+                  names_glue='fit_{variable}')
+  })
+# gs <- glue("gene_{sample(100, 20)}")
+# model_fits <- burst_params_int %>%
+#   filter(gene %in% gs) %>%
+#   group_by(gene, type) %>%
+#   group_map(\(df, name){
+#     
+#     data$counts <- df$counts[[1]]
+#     data$count_n <- length(df$counts[[1]])
+#     data$rates <- df$p[[1]]
+#     mod$sample(data, chains=2, show_messages=FALSE)$summary(c("mu", "log_bs"))
+#   })
+
+names(model_fits) <- glue("{burst_params_int$gene}_{burst_params_int$type}")
+model_fits <- list_rbind(model_fits, names_to = 'gene')
+
+model_fits <- model_fits %>%
+  mutate(type = str_remove(gene, "gene_[0-9]+_"),
+         gene = str_remove(gene, "_[ab]")
+         ) %>%
+   # pivot_wider(id_cols = c("gene", "type"), 
+   #             names_from=variable, 
+   #             values_from = 'mean', 
+   #             names_glue = "fit_{variable}") %>% 
+  merge(burst_params_int, by = c("gene", "type"), all.x = TRUE) %>%
+  select(gene, type, fit_mu, mean_exprs, bs, fit_log_bs)
+
+model_fits <- model_fits %>%
+  mutate(log_bs = log(bs, 10))
+# model_fits <- merge(sim_burst_params, model_fits, by = 'gene') %>%
+#   select(gene, fit_mu, mean_exprs, fit_burst_size, bs, type)
+```
+
+```{r}
+p8 <- model_fits %>% 
+  mutate(diff_log = abs(fit_log_bs-log_bs)) %>% 
+  filter(diff_log < .3) %>%
+  ggplot(aes(log(fit_mu,10), log(mean_exprs,10))) + 
+  geom_abline(
+    slope=1,
+    intercept=0,
+    linewidth=1.5,
+    linetype='dashed',
+    alpha=0.75,
+    color='red'
+  ) + 
+  geom_point(shape=21, fill='gray', alpha=0.8,size=rel(2)) +
+  theme_bw() + 
+  labs(
+    x = TeX(r'(Fitted log($\hat{k/\gamma}$))'),
+    y = TeX(r'(True log($k/\gamma$))')
+  )+
+  theme(
+    aspect.ratio=1,
+    panel.grid = element_blank(),
+  ) 
+p8
+ggsave('mu_givep.png', p8, width=2,height=2, scale=2)
+```
