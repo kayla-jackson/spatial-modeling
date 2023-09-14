@@ -42,8 +42,13 @@ vignettes/*.pdf
 # pkgdown site
 docs/
 
+# Presentations and misc, for now
+presentations/
+misc/
+
 # translation temp files
 po/*~
 
 # RStudio Connect folder
 rsconnect/
+.Rproj.user
