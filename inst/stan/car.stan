@@ -1,10 +1,9 @@
 data {
   int<lower=0> N; // number of areal units
   int<lower=0> count_n; // number of fitted points
-  int<lower=0> counts[count_n]; // the data
   
+  array[count_n] int<lower=0> counts; // the data
   array[count_n] int<lower=0, upper=N> count_inds; //location of the counts?
-  // vector<lower=0, upper=1>[N] phi; // probability of capture
   
   real bs_mu;
   real mu_mu;
