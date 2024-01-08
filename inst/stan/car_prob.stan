@@ -1,6 +1,6 @@
 data {
   int<lower=0> count_n; // number of fitted points
-  int<lower=0> counts[count_n]; // the data
+  array[count_n] int<lower=0> counts; // the data
   
   vector<lower=0, upper=1>[count_n] rates; // probability of capture
   

@@ -27,6 +27,7 @@ library(purrr)
 library(dplyr)
 library(tidyr)
 library(ggplot2)
+p1library(latex2exp)
 
 library(posterior)
 library(bayesplot)
@@ -76,7 +77,7 @@ check_overlap <- function(data, x, y){
 # Load Data
 ```{r}
 # Load physical parameters
-burst_params <- read_csv("data/Larsson_c57_kinetic_params.csv", skip=1,
+burst_params <- read_csv("../data/Larsson_c57_kinetic_params.csv", skip=1,
                          col_names = c("gene", "mean_exprs","bs", 'bs_conf'),
                          show_col_types = FALSE)
 
@@ -317,14 +318,14 @@ plot(dfc[genes], max.plot=20)
 ```
 # Fit Poisson CAR model with Stan
 ```{r, pois-border}
-pois.file <- path("./stan/pois",ext="stan")
+pois.file <- path("../inst/stan/pois", ext="stan")
 
 # Compile and run
 pois.mod <- cmdstan_model(pois.file)
 ```
 Data set up for border model
 ```{r}
-g <- 'gene_23'
+g <- 'gene_47'
 
 nodes <- which(W_ext==1, arr.ind=TRUE)
 nodes <- nodes[nodes[,1] < nodes[,2],]
@@ -349,14 +350,15 @@ data <- list(
   N_edges = nrow(nodes), 
   D=as.matrix(D_ext),
   W = as.matrix(W_ext),
-  mu = tst,
-  #mu = rep(10, 36),
+  mu = mu,
+  #mu = rep(1, 36),
   counts = y
 )
 
 ```
 
 ```{r}
+# errors if mu = 0
 fit.pois <- pois.mod$sample(data, chains=2)
 ```
 
@@ -376,7 +378,7 @@ $Y_{cg} \sim \text{Neg.Binomial}(\frac{\alpha}{\gamma}, bp)$
 where, $Y_{cg}$ represents the observed count in cell $c$ of gene $g$. The parameters $\alpha, \gamma,$ and $b$ are gene specific transcription rates, degradation rates, and burst sizes, respectively. The paramter $p$ is a technical parameter that represents the probability that a molecule is captured at each grid location. As written, the parameters are not uniquely identifiable. 
 
 ```{r stan_setup}
-file <- path("stan/car",ext="stan")
+file <- path("../inst/stan/car",ext="stan")
 mod <- cmdstan_model(file)
 # mod$print()
 ```
@@ -384,8 +386,11 @@ mod <- cmdstan_model(file)
 ## Format data for stan
 ```{r}
 # Test on one gene
+g <- 'gene_52'
+
 y <- dfc[dfc$type_border == "b_FALSE",][[g]]
 hyperpars <- fit.pois$summary(c("car_rho", "car_scale"))$mean
+
 # cndl_means <- crossprod(W, y)[,]/nn
 # log_cndl_means <-  log(cndl_means+.Machine$double.eps,10)
 
@@ -394,7 +399,7 @@ data <-
     N = grid_size^2,
     W = W,
     count_n = length(y),
-    count_inds = which(dfc$type_border == 'b_FALSE'),
+    count_inds = which(dfc$type_border == 'a_FALSE'),
     car_rho=hyperpars[1],
     car_scale=hyperpars[2],
     bs_mu = 0,
@@ -413,7 +418,7 @@ burst_params_int %>%
 ```
 
 ```{r}
-fit <- mod$sample(data, chains=2, show_messages=FALSE)
+fit <- mod$sample(data, chains=2, num_warmup = 2000, show_messages=FALSE)
 fit$summary(c("mu", "log_bs"))
 ```
 
@@ -422,14 +427,12 @@ data <-
   list(
     N = grid_size^2,
     W = W,
-    # count_n = length(y),
-    # count_inds = which(dfc$type_border == 'b_FALSE'),
     car_rho=hyperpars[1],
     car_scale=hyperpars[2],
     bs_mu = 0,
     bs_var = 1, 
     mu_mu = 0, 
-    mu_var = 5, 
+    mu_var = 5 
     # counts = y
   )
 
@@ -438,12 +441,13 @@ fits_all <- burst_params_int %>%
   group_map(~ {
     data$counts <- .x$counts[[1]]
     data$count_n <- length(.x$counts[[1]])
-    data$count_ind <- which(dfc$type_border == .x$type_border[1])
+    data$count_inds <- which(dfc$type_border == .x$type_border[1])
     
     mod$sample(data, chains=2, show_messages=FALSE)$summary(c("mu", "log_bs"))
     
   })
 ```
+
 Wrangle the fits
 ```{r}
 nm <-  glue("{burst_params_int$gene}_{burst_params_int$type}")
@@ -456,7 +460,51 @@ fits_all <- bind_rows(fits_all, .id="id") %>%
 fits_all_mean <- fits_all %>% select(type, gene, variable, mean) %>% 
   pivot_wider(names_from = variable, values_from = mean)
 
+```
+Add burst parameters to fits
+```{r}
+fits_all_mean2 <- fits_all_mean %>%
+    merge(burst_params_int)  %>% 
+    select(type, gene, mu, log_bs, mean_exprs, bs, p)
 
+fits_all_mean2$phi_nb <- pmap(fits_all_mean2, \(log_bs, p,...) (10^log_bs)*p)
+
+# Compute variance at each spatial location
+fits_all_mean2$var_nb <- pmap(fits_all_mean2, \(mu, phi_nb,...) mu * (1 + mu/phi_nb))
+```
+# Gene stats
+```{r}
+# gene_stats <- fits_all_mean2 %>% 
+#   group_by(gene) %>% 
+#   group_map(\(df, name) c(name, evpv = mean(unlist(df$var_nb)/2))) %>% 
+#   bind_rows()
+# gene_stats$var_nb <- rowvars[gene_stats$gene]
+data_p1 <- fits_all_mean %>% 
+  mutate(bs = 10^log_bs, var = mu * (1 + mu/bs)) %>% 
+  group_by(gene) %>% summarise(unexpl_ct_var = mean(var), expl_ct_var = var(mu))  %>% 
+  mutate(var_gene = unexpl_ct_var + expl_ct_var, frac_unexpl = unexpl_ct_var/ var_gene) %>%
+  merge(distinct(burst_params_int[c('gene', 'moran')]))
+
+
+p1 <-  ggplot(data_p1, aes(frac_unexpl, moran)) +
+  geom_vline(
+    xintercept=0.50,
+    linetype='dashed',
+    alpha=0.75,
+    color='red') + 
+    geom_hline(
+      yintercept = 0,
+      linetype='dashed',
+      alpha=0.75,
+      color='red')+ 
+    geom_point(shape=21, fill='gray', alpha=0.8,size=rel(2))  +
+  theme_bw() + 
+  theme(
+    aspect.ratio=1,
+    panel.grid = element_blank(),
+  )
+
+ggsave('moran_fracunexpl_11142023.png', p1, width=2,height=2, scale=2)
 ```
 
 ```{r}
@@ -551,7 +599,7 @@ stan.optim <- function(model, data, counts, rates, ...){
 ```
 
 ```{r}
-file <- path("stan/car_prob",ext="stan")
+file <- path("../inst/stan/car_prob",ext="stan")
 mod <- cmdstan_model(file)
 ```
 
@@ -627,6 +675,7 @@ p8 <- model_fits %>%
     aspect.ratio=1,
     panel.grid = element_blank(),
   ) 
+
 p8
 ggsave('mu_givep.png', p8, width=2,height=2, scale=2)
 ```
