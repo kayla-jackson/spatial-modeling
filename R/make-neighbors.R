@@ -41,6 +41,16 @@ make_adjacency_exterior <- function(grid_size){
   W
 }
 
+get_border <- function(grid_size)
+{
+  border <- which((1:grid_size^2 %% grid_size == 1) | (1:grid_size^2 %% grid_size == 0))
+  border <- c(border, 1:grid_size, (grid_size^2-grid_size+1):grid_size^2)
+  
+  
+  1:grid_size^2 %in% border
+  
+}
+
 st_rook = function(a, b = a) sf::st_relate(a, b, pattern = "F***1****")
 
 as_nb_sgbp <- function(x, ...) {
