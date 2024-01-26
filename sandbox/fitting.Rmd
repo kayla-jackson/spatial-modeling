@@ -27,7 +27,7 @@ library(purrr)
 library(dplyr)
 library(tidyr)
 library(ggplot2)
-p1library(latex2exp)
+library(latex2exp)
 
 library(posterior)
 library(bayesplot)
@@ -103,6 +103,7 @@ burst_params <-
 grid_size = 10
 n_celltypes = 2
 n_genes = 100
+
 labels <- letters[seq(n_celltypes)]
 remainder <- grid_size^2 %% n_celltypes
 
@@ -325,7 +326,7 @@ pois.mod <- cmdstan_model(pois.file)
 ```
 Data set up for border model
 ```{r}
-g <- 'gene_47'
+g <- 'gene_91'
 
 nodes <- which(W_ext==1, arr.ind=TRUE)
 nodes <- nodes[nodes[,1] < nodes[,2],]

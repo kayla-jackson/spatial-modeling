@@ -1,0 +1,197 @@
+---
+title: "Using spatial model to estimate gene parameters"
+output: html_notebook
+---
+
+
+```{r}
+library(SFEData)
+library(SpatialFeatureExperiment)
+library(Voyager)
+```
+Load Visium MSK dataset from `SFEData`
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+```{r}
+sfe <- McKellarMuscleData("small")
+# load("~/Downloads/vis_slim_v1.RData")
+```
+Plot the in/out tissue metadata
+```{r}
+plotSpatialFeature(sfe, c("in_tissue",'nCounts'),
+    colGeometryName='spotPoly', annotGeometryName = 'myofiber_simplified')
+```
+
+Want to locate genes that have expression in empty spots, to fit the Poisson model. Recall, genes are on the rows
+```{r}
+tissue <- colData(sfe)$in_tissue
+n_exprs_empty <- rowSums(counts(sfe[,!tissue]) > 0)
+genes_exprs_empty <- rownames(sfe)[which(n_exprs_empty >= 10)]
+
+gene_mask <- rowData(sfe)$Ensembl %in% genes_exprs_empty
+
+rowSums(counts(sfe[gene_mask, !tissue]))
+```
+Plot spatial features
+```{r}
+plotSpatialFeature(sfe, c("ENSMUSG00000064358", "ENSMUSG00000064351", "ENSMUSG00000064354"),
+    exprs_values='counts', annotGeometryName = "myofiber_simplified")
+```
+
+Compute relevant spatial graphs...
+```{r}
+# full adjacency matrix
+g <- findVisiumGraph(sfe, style="B")
+W <- spdep::nb2mat(g$neighbours, style="B")
+
+# For empty spots...
+g <- findVisiumGraph(sfe[,!tissue], style="B")
+W_ext <-  spdep::nb2mat(g$neighbours, style="B")
+
+# For tissue spots...
+g <- findVisiumGraph(sfe[,tissue], style="B")
+W_int <-  spdep::nb2mat(g$neighbours, style="B")
+```
+Compute estimated means for poisson model
+
+```{r, pois-border}
+pois.file <- fs::path("./inst/stan/pois", ext="stan")
+
+# Compile and run
+pois.mod <- cmdstanr::cmdstan_model(pois.file)
+```
+
+Set up data for fitting
+
+```{r}
+g1 <- counts(sfe)['ENSMUSG00000064358',]
+means <- crossprod(W, g1)/rowSums(W)
+means <- means[!tissue,1]
+
+nodes <- which(W_ext==1, arr.ind=TRUE)
+nodes <- nodes[nodes[,1] < nodes[,2],]
+
+D_ext <- diag(x=rowSums(W_ext))
+
+data <- list(
+  N = length(means), 
+  N_edges = nrow(nodes), 
+  D=as.matrix(D_ext),
+  W = as.matrix(W_ext),
+  mu = means,
+  counts = g1[!tissue]
+)
+```
+Finally, the fit
+```{r}
+# errors if mu = 0
+fit.pois <- pois.mod$sample(data, chains=2)
+```
+
+Now, we will fit the interior spots 
+```{r stan_setup}
+file <- fs::path("./inst/stan/car",ext="stan")
+mod <- cmdstanr::cmdstan_model(file)
+# mod$print()
+```
+
+Data set up...
+```{r}
+# Test on one gene
+g <- 'ENSMUSG00000029304'
+keep <- colData(sfe)$types %in% 4
+
+y <- counts(sfe)[g,keep]
+hyperpars <- fit.pois$summary(c("car_rho", "car_scale"))$mean
+
+
+data <- 
+  list(
+    N = 77,
+    W = W,
+    count_n = length(y),
+    count_inds = which(keep),
+    car_rho=hyperpars[1],
+    car_scale=hyperpars[2],
+    bs_mu = 0, 
+    bs_var = 1, 
+    mu_mu = 0, 
+    mu_var = 5, 
+    counts = y
+  )
+```
+Now the fit
+```{r}
+fit <- mod$sample(data, chains=2, iter_warmup = 2000, show_messages=FALSE)
+fit$summary(c("mu", "log_bs"))
+``` 
+
+Let's try to fit for a sample of the genes from the dataset
+```{r}
+genes <- sample(keep_genes, 20, replace=FALSE)
+fits_all_20 <-map(genes, \(g){
+  data$counts <-  counts(sfe)[g,keep]
+  data$count_n <- length(counts(sfe)[g,keep])
+  data$count_inds = which(keep)
+  
+  mod$sample(data, chains=2, show_messages=FALSE)$summary(c("mu", "log_bs"))
+})
+
+```
+Wrangle fits
+```{r}
+names(fits_all_20) <- genes
+fits_all_20 <- bind_rows(fits_all_20, .id='gene') 
+
+fits_all_20 <-  fits_all_20 %>% 
+  select(gene, variable, mean) %>% 
+  pivot_wider(names_from='variable', values_from = 'mean')
+```
+observed gene means
+```{r}
+obs <- data.frame(gene = genes, obs_mean2 = rowMeans(counts(sfe)[genes,keep]))
+
+fits_all_20 <- left_join(fits_all_20, obs)
+```
+Plot some results
+```{r}
+# Mean fit with observed mean? 
+ggplot(fits_all_20, aes(mu, obs_mean2, label=gene)) + 
+  geom_point(
+    shape=21,
+    stroke=1
+  ) + 
+  #geom_label() + 
+  geom_abline(slope=1, intercept=0) +
+  theme_bw()
+```
+Plot some histograms
+```{r}
+ps <- map(genes, \(x){
+  p <- data.frame(gene =x, counts=counts(sfe)[g,keep])%>%
+    ggplot(aes(x = counts)) + 
+    geom_histogram()
+  
+  mu <- fits_all_20 %>% filter(gene %in% x) %>% pull(mu)
+  logbs <- fits_all_20 %>% filter(gene %in% x) %>% pull(log_bs)
+  bs <- 10^logbs
+  
+  vals <- rnbinom(55, size=mu, prob=bs/(1+bs))
+  # p2 <- data.frame(sampled = vals) %>%
+  #   ggplot(aes(x = sampled)) + 
+  #   geom_density(colour = 'red')
+  
+  p + 
+    geom_histogram(
+      aes(x = sampled), 
+      data =  data.frame(sampled = vals),
+      color = 'red', alpha=0.4) +
+    theme_bw()
+})
+
+```
+Display
+```{r}
+#Display 
+cowplot::plot_grid(plotlist=ps, nrow = 4)
+```
+
