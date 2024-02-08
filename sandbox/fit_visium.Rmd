@@ -6,14 +6,42 @@ output: html_notebook
 
 ```{r}
 library(SFEData)
+library(SingleCellExperiment)
 library(SpatialFeatureExperiment)
 library(Voyager)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
 ```
 Load Visium MSK dataset from `SFEData`
 Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
 ```{r}
 sfe <- McKellarMuscleData("small")
-# load("~/Downloads/vis_slim_v1.RData")
+load("../data/vis_slim_v1.RData") # Contains author cell type labels
+```
+```{r}
+# Subset a sfe object
+sfe_tissue <- sfe[,colData(sfe)$in_tissue]
+colGraph(sfe_tissue, "visium") <- findVisiumGraph(sfe_tissue)
+
+features_use <- names(rowSums(counts(sfe_tissue)) > 10)
+```
+# Run Moran's I
+Here, I'm only using the spots that overlap tissue to estimate Moran's I. Because most empty spots do not have RNA, there is a sort of "built-in" spatial correlation between tissue containing and empty spots. This is not the relationship that we're interested in, however. In the cells below, I will compute Moran's I on a subset of the features and focus on genes with high spatial autocorrelation. 
+```{r}
+sfe_tissue <- runMoransI(sfe_tissue,
+    features = features_use, colGraphName = "visium",
+    exprs_values = "counts"
+  )
+```
+Take a look at some of the results
+```{r}
+moran_order <- order(rowData(sfe_tissue)[["moran_Vis5A"]], decreasing = TRUE, na.last=NA)
+moran_res <- rowData(sfe_tissue)[moran_order, c('Ensembl', "symbol", "moran_Vis5A")]
+
+head(moran_res, 10)
 ```
 Plot the in/out tissue metadata
 ```{r}
@@ -24,16 +52,36 @@ plotSpatialFeature(sfe, c("in_tissue",'nCounts'),
 Want to locate genes that have expression in empty spots, to fit the Poisson model. Recall, genes are on the rows
 ```{r}
 tissue <- colData(sfe)$in_tissue
-n_exprs_empty <- rowSums(counts(sfe[,!tissue]) > 0)
+n_exprs_empty <- rowSums(SingleCellExperiment::counts(sfe[,!tissue]) > 0)
 genes_exprs_empty <- rownames(sfe)[which(n_exprs_empty >= 10)]
 
 gene_mask <- rowData(sfe)$Ensembl %in% genes_exprs_empty
 
-rowSums(counts(sfe[gene_mask, !tissue]))
+# rowSums(counts(sfe[gene_mask, !tissue]))
 ```
+Barcode matching to obtain cell identities 
+```{r}
+bcs <- colData(sfe)$barcode
+author_idents <- Seurat::Idents(vis.list[[1]])
+names(author_idents) <- stringr::str_replace(names(author_idents), "-[0-9]+", "")
+
+ct_mask <-  which(names(author_idents) %in% bcs)
+
+ct <- rep(NA, ncol(sfe))
+ct[bcs %in% names(author_idents)] <- (author_idents[ct_mask])
+
+colData(sfe)$author_idents <- ct
+colData(sfe)[!tissue, "author_idents"] <- "empty"
+```
+Plot "cell type"  label
+```{r}
+plotSpatialFeature(sfe, c("author_idents", "in_tissue"),
+    colGeometryName='spotPoly', annotGeometryName = 'myofiber_simplified')
+```
+
 Plot spatial features
 ```{r}
-plotSpatialFeature(sfe, c("ENSMUSG00000064358", "ENSMUSG00000064351", "ENSMUSG00000064354"),
+plotSpatialFeature(sfe, c("ENSMUSG00000025172", "ENSMUSG00000030470", "ENSMUSG00000056328"),
     exprs_values='counts', annotGeometryName = "myofiber_simplified")
 ```
 
@@ -48,13 +96,13 @@ g <- findVisiumGraph(sfe[,!tissue], style="B")
 W_ext <-  spdep::nb2mat(g$neighbours, style="B")
 
 # For tissue spots...
-g <- findVisiumGraph(sfe[,tissue], style="B")
+g <- findVisiumGraph(sfe_tissue, style="B")
 W_int <-  spdep::nb2mat(g$neighbours, style="B")
 ```
 Compute estimated means for poisson model
 
 ```{r, pois-border}
-pois.file <- fs::path("./inst/stan/pois", ext="stan")
+pois.file <- fs::path("../inst/stan/pois", ext="stan")
 
 # Compile and run
 pois.mod <- cmdstanr::cmdstan_model(pois.file)
@@ -63,84 +111,123 @@ pois.mod <- cmdstanr::cmdstan_model(pois.file)
 Set up data for fitting
 
 ```{r}
-g1 <- counts(sfe)['ENSMUSG00000064358',]
-means <- crossprod(W, g1)/rowSums(W)
-means <- means[!tissue,1]
+genes_exprs_empty <- which(features_use %in% genes_exprs_empty)
+genes_exprs_empty <- features_use[genes_exprs_empty]
 
-nodes <- which(W_ext==1, arr.ind=TRUE)
-nodes <- nodes[nodes[,1] < nodes[,2],]
-
-D_ext <- diag(x=rowSums(W_ext))
+# nodes <- which(W_ext==1, arr.ind=TRUE)
+# nodes <- nodes[nodes[,1] < nodes[,2],]
 
 data <- list(
-  N = length(means), 
-  N_edges = nrow(nodes), 
-  D=as.matrix(D_ext),
-  W = as.matrix(W_ext),
-  mu = means,
-  counts = g1[!tissue]
+  N = dim(W_ext)[1], 
+  count_n = sum(!tissue), 
+  #count_inds = which(!tissue),
+  count_inds = seq(sum(!tissue)),
+  W = as.matrix(W_ext)
 )
+
 ```
-Finally, the fit
+Finally, the fit for all genes
 ```{r}
-# errors if mu = 0
-fit.pois <- pois.mod$sample(data, chains=2)
+pois.mods <- lapply(genes_exprs_empty, function(i){
+
+  data$mu <-  rep(mean(counts(sfe)[i,!tissue])/0.5, sum(!tissue))
+  data$counts <- counts(sfe)[i,!tissue]
+  
+  
+  mod <-  pois.mod$optimize(data)
+  mod
+})
+```
+
+```{r}
+mods_params <- purrr::map(pois.mods, \(x) x$summary(c("car_rho", "car_rho_trans", "car_scale")))
+mods_params <- bind_rows(mods_params, .id = 'group')
+
+mods_params <- mods_params |>
+  pivot_wider(
+    id_cols = group,
+    names_from = variable,
+    values_from = estimate) 
+
+hyperpars <- summarise(mods_params, across(where(is.numeric), mean))
 ```
 
 Now, we will fit the interior spots 
 ```{r stan_setup}
-file <- fs::path("./inst/stan/car",ext="stan")
+file <- fs::path("../inst/stan/car",ext="stan")
 mod <- cmdstanr::cmdstan_model(file)
-# mod$print()
+
 ```
 
 Data set up...
 ```{r}
-# Test on one gene
-g <- 'ENSMUSG00000029304'
-keep <- colData(sfe)$types %in% 4
+g <- 'ENSMUSG00000056328'
+keep <- colData(sfe)[tissue, "author_idents"] %in% c(4, NA)
 
-y <- counts(sfe)[g,keep]
-hyperpars <- fit.pois$summary(c("car_rho", "car_scale"))$mean
+y <- counts(sfe)[g, tissue][keep]
 
+nodes <- which(W_int==1, arr.ind=TRUE)
+nodes <- nodes[nodes[,1] < nodes[,2],]
 
 data <- 
   list(
-    N = 77,
-    W = W,
-    count_n = length(y),
+    N = sum(tissue),
+    #car_scale = hyperpars[['car_scale']], 
+    car_scale=1, 
+    #car_rho =   hyperpars[['car_rho']], 
+    car_rho = 0.33,
+    W = W_int,
+    counts = y, 
+    count_n = sum(keep),
     count_inds = which(keep),
-    car_rho=hyperpars[1],
-    car_scale=hyperpars[2],
+    #count_inds = seq(sum(tissue)),
+
     bs_mu = 0, 
-    bs_var = 1, 
+    bs_var = 2, 
     mu_mu = 0, 
-    mu_var = 5, 
-    counts = y
+    mu_var = 1
   )
 ```
+Fit the NB ICAR model
+```{r}
+# icar_mod <- cmdstanr::cmdstan_model("./inst/stan/nb_icar.stan")
+```
+
 Now the fit
 ```{r}
-fit <- mod$sample(data, chains=2, iter_warmup = 2000, show_messages=FALSE)
-fit$summary(c("mu", "log_bs"))
+# fit <- mod$sample(data, chains=2, iter_warmup = 1000, show_messages=FALSE)
+fit <- mod$optimize(data)
+fit$summary(c("trans_rate", "beta_"))
+# fit$summary(paste0('rates[',1:57,']'))$estimate
+
+trans_rate <- fit$summary("trans_rate")$estimate
+bs <- fit$summary("beta_")$estimate
+mean_est <- mean(fit$summary(paste0('rates[',1:55,']'))$estimate)
+
+trans_rate / bs / mean_est
 ``` 
 
 Let's try to fit for a sample of the genes from the dataset
 ```{r}
-genes <- sample(keep_genes, 20, replace=FALSE)
-fits_all_20 <-map(genes, \(g){
-  data$counts <-  counts(sfe)[g,keep]
-  data$count_n <- length(counts(sfe)[g,keep])
-  data$count_inds = which(keep)
+genes <- sample(genes_exprs_empty, 20, replace=FALSE)
+fits_all_20 <- purrr::map(genes, \(g){
+  data$counts <-  counts(sfe)[g,tissue]
+  data$count_n <- length(counts(sfe)[g,tissue])
+  data$count_inds = seq(sum(tissue))
   
-  mod$sample(data, chains=2, show_messages=FALSE)$summary(c("mu", "log_bs"))
+   
+  mod$sample(data, chains=2, show_messages=FALSE)
 })
 
 ```
 Wrangle fits
 ```{r}
 names(fits_all_20) <- genes
-fits_all_20 <- bind_rows(fits_all_20, .id='gene') 
+fits_all_20 <- lapply(fits_all_20, 
+                      function(x) x$summary(
+                        c('mu', 'log_bs', "burst_size", paste0('rates[',1:57,']')))
+                      ) %>%
+  bind_rows(.id='gene') 
 
 fits_all_20 <-  fits_all_20 %>% 
   select(gene, variable, mean) %>% 
@@ -148,7 +235,7 @@ fits_all_20 <-  fits_all_20 %>%
 ```
 observed gene means
 ```{r}
-obs <- data.frame(gene = genes, obs_mean2 = rowMeans(counts(sfe)[genes,keep]))
+obs <- data.frame(gene = genes, obs_mean2 = rowMeans(counts(sfe)[genes,tissue]))
 
 fits_all_20 <- left_join(fits_all_20, obs)
 ```
@@ -167,7 +254,7 @@ ggplot(fits_all_20, aes(mu, obs_mean2, label=gene)) +
 Plot some histograms
 ```{r}
 ps <- map(genes, \(x){
-  p <- data.frame(gene =x, counts=counts(sfe)[g,keep])%>%
+  p <- data.frame(gene =x, counts=counts(sfe)[g,tissue])%>%
     ggplot(aes(x = counts)) + 
     geom_histogram()
   

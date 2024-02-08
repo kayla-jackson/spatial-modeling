@@ -92,17 +92,17 @@ make_counts <- function(
     rnbinom(grid_size^2*n_genes, size=gene.params$means, prob=1/(1+gene.params$disp)),
     nrow=n_genes, ncol=grid_size^2)
   
-  if(empty_border){
+  if (empty_border){
     # Sample counts along the border
     border <- get_border(grid_size)
     pois.counts <- matrix(
       rpois(grid_size^2*n_genes, lambda=gene.params$means*gene.params$disp),
       nrow=n_genes, ncol=grid_size^2
     )
-
+    
+    nb.counts[,border] <- pois.counts[,border]
   }
   
-  nb.counts[,border] <- pois.counts[,border]
   dimnames(nb.counts) <- dimnames(gene.params$means)
   
   message("Returning counts...")
